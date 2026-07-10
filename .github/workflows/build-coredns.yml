@@ -109,9 +109,10 @@ jobs:
           # generate/get 用 host 平台(linux/amd64)跑一次即可
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go generate coredns.go
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go get
-          # make 用目标平台交叉编译
-          make
+          # make 用目标平台交叉编译; Windows 需显式指定 .exe 输出名(Makefile 硬编码 -o coredns 不会自动加扩展名)
           BIN=coredns; [ "$GOOS" = "windows" ] && BIN=coredns.exe
+          make BINARY="$BIN"
+          test -f "./$BIN" || { echo "FATAL: 编译产物 $BIN 不存在"; exit 1; }
           file "./$BIN"
           # === 硬校验②: dnsredir 必须真正编入二进制 ===
           if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then
@@ -119,7 +120,7 @@ jobs:
             ./coredns -plugins
             ./coredns -plugins | grep -qE 'dnsredir$' && echo "OK: dnsredir 已编入(运行验证)" || { echo "FATAL: dnsredir 缺失"; exit 1; }
           else
-            # 交叉编译平台: 无法运行, 用符号表验证
+            # 交叉编译平台(arm/windows): 无法运行, 用符号/字符串验证
             (go tool nm "./$BIN" 2>/dev/null | grep -q 'leiless/dnsredir' || strings "./$BIN" | grep -q 'leiless/dnsredir') \
               && echo "OK: dnsredir 已编入(符号验证)" || { echo "FATAL: dnsredir 缺失"; exit 1; }
           fi
