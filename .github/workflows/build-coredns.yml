@@ -1,0 +1,91 @@
+name: build coredns
+
+# 手动触发 + 可选平台参数
+on:
+  workflow_dispatch:
+    inputs:
+      goos:
+        description: 'GOOS (linux/windows/darwin/freebsd...)'
+        required: true
+        default: 'linux'
+      goarch:
+        description: 'GOARCH (amd64/arm64/arm/386...)'
+        required: true
+        default: 'amd64'
+      goarm:
+        description: 'GOARM (只 arm 用: 5/6/7, 其他留空)'
+        required: false
+        default: ''
+      lite:
+        description: 'LITE 精简版? (1=是, 空=否)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom build repo
+        uses: actions/checkout@v4
+        with:
+          path: coredns_custom_build
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Clone coredns + dnsredir (同级目录)
+        run: |
+          git clone --depth=1 https://github.com/coredns/coredns.git
+          git clone --depth=1 https://github.com/leiless/dnsredir.git
+
+      - name: Apply patches + inject plugins
+        working-directory: coredns
+        run: |
+          CUSTOM="$GITHUB_WORKSPACE/coredns_custom_build"
+          git apply "$CUSTOM/forward.go.patch"
+          git apply "$CUSTOM/forward-setup.go.patch"
+          NL=$'\\\n'
+          sed -i.bak "s|forward:forward|fallback:github.com/missdeer/fallback${NL}dnsredir:github.com/leiless/dnsredir${NL}forward:forward${NL}proxy:github.com/missdeer/proxy${NL}https:github.com/v-byte-cpu/coredns-https|g" plugin.cfg
+          sed -i.bak "s|hosts:hosts|ads:github.com/missdeer/ads${NL}blocklist:github.com/relekang/coredns-blocklist${NL}hosts:hosts|g" plugin.cfg
+          sed -i.bak "s|rewrite:rewrite|rewrite:rewrite${NL}bogus:github.com/missdeer/bogus${NL}ipset:github.com/missdeer/ipset|g" plugin.cfg
+          sed -i.bak "s|cache:cache|cache:cache${NL}redisc:github.com/missdeer/redis|g" plugin.cfg
+          printf '\nreplace (\n    github.com/leiless/dnsredir => ../dnsredir\n)\n' >> go.mod
+          for p in azure route53 trace etcd clouddns k8s_external kubernetes; do
+            sed -i.bak "/$p/d" plugin.cfg
+          done
+          if [ "${{ github.event.inputs.lite }}" = "1" ]; then
+            for p in geoip nsid debug trace autopath erratic metadata cancel pprof dnstap dns64 acl chaos dnssec secondary loop grpc sign; do
+              sed -i.bak "/$p/d" plugin.cfg
+            done
+          fi
+          rm -f plugin.cfg.bak
+          echo "----- plugin.cfg -----"
+          cat plugin.cfg
+
+      - name: Build
+        working-directory: coredns
+        env:
+          GOOS: ${{ github.event.inputs.goos }}
+          GOARCH: ${{ github.event.inputs.goarch }}
+          GOARM: ${{ github.event.inputs.goarm }}
+          CGO_ENABLED: '0'
+          GO111MODULE: 'on'
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go generate coredns.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go get ./... || CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go get
+          make
+          BIN=coredns; [ "$GOOS" = "windows" ] && BIN=coredns.exe
+          file "./$BIN"
+          echo "==== plugins ===="
+          [ "$GOOS$GOARCH" = "linuxamd64" ] && ./coredns -plugins || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coredns-${{ github.event.inputs.goos }}-${{ github.event.inputs.goarch }}${{ github.event.inputs.goarm }}${{ github.event.inputs.lite && '-lite' || '' }}
+          path: |
+            coredns/coredns
+            coredns/coredns.exe
+          if-no-files-found: warn
