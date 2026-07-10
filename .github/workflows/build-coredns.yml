@@ -1,21 +1,9 @@
 name: build coredns
 
-# 手动触发 + 可选平台参数
+# 手动触发即可; 一次并行编译所有平台
 on:
   workflow_dispatch:
     inputs:
-      goos:
-        description: 'GOOS (linux/windows/darwin/freebsd...)'
-        required: true
-        default: 'linux'
-      goarch:
-        description: 'GOARCH (amd64/arm64/arm/386...)'
-        required: true
-        default: 'amd64'
-      goarm:
-        description: 'GOARM (只 arm 用: 5/6/7, 其他留空)'
-        required: false
-        default: ''
       lite:
         description: 'LITE 精简版? (1=是, 空=否)'
         required: false
@@ -24,6 +12,32 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # 某个平台失败不影响其它平台继续编
+      matrix:
+        include:
+          - name: linux-amd64        # Alpine / Debian x86_64 (你的 lanDNS53)
+            goos: linux
+            goarch: amd64
+            goarm: ''
+          - name: windows-amd64      # Windows 10 / 11 x64
+            goos: windows
+            goarch: amd64
+            goarm: ''
+          - name: linux-arm64        # 树莓派 3/4/5 (64位系统, aarch64)
+            goos: linux
+            goarch: arm64
+            goarm: ''
+          - name: linux-armv7        # 树莓派 2/3/4 (32位系统)
+            goos: linux
+            goarch: arm
+            goarm: '7'
+          - name: linux-armv6        # 树莓派 1 / Zero / Zero W
+            goos: linux
+            goarch: arm
+            goarm: '6'
+
+    name: build-${{ matrix.name }}
     steps:
       - name: Checkout custom build repo
         uses: actions/checkout@v5
@@ -36,8 +50,7 @@ jobs:
           go-version: '1.26'
           cache: false
         env:
-          # 允许 Go 按 coredns/.go-version 自动拉取精确 toolchain(1.26.5)
-          GOTOOLCHAIN: auto
+          GOTOOLCHAIN: auto   # 按 coredns/.go-version 自动拉精确 toolchain
 
       - name: Clone coredns + dnsredir (同级目录)
         run: |
@@ -50,26 +63,19 @@ jobs:
           set -e
           F=plugin/forward/forward.go
           S=plugin/forward/setup.go
-          # 1) 加 strings import
           perl -0pi -e 's/(\t"errors"\n)/$1\t"strings"\n/' "$F"
-          # 2) 字段类型 slice -> map
           perl -0pi -e 's/\tignored \[\]string/\tignored map[string]struct{}/' "$F"
-          # 3) New() 里初始化 map (原补丁遗漏, 否则运行时 panic)
           perl -0pi -e 's/(f := &Forward\{maxfails: 2,)/$1 ignored: make(map[string]struct{}),/' "$F"
-          # 4) isAllowedDomain: 逐级后缀查 map (加速 except 列表)
           perl -0pi -e 's/\tfor _, ignore := range f\.ignored \{\n\t\tif plugin\.Name\(ignore\)\.Matches\(name\) \{\n\t\t\treturn false\n\t\t\}\n\t\}/\tss := strings.Split(name, ".")\n\tfor i := 0; i < len(ss); i++ {\n\t\tn := strings.Join(ss[i:], ".")\n\t\tif _, ok := f.ignored[n]; ok {\n\t\t\treturn false\n\t\t}\n\t}/' "$F"
-          # 5) setup.go: 写入 map 而非 append slice
           perl -0pi -e 's/\t\t\tf\.ignored = append\(f\.ignored, plugin\.Host\(ignore\[i\]\)\.NormalizeExact\(\)\.\.\.\)/\t\t\tfor _, ignored := range plugin.Host(ignore[i]).NormalizeExact() {\n\t\t\t\tf.ignored[ignored] = struct{}{}\n\t\t\t}/' "$S"
-          echo "----- forward.go 变更校验 -----"
-          grep -n "ignored map\[string\]struct{}" "$F"
-          grep -n "ignored: make(map\[string\]struct{})" "$F"
-          grep -n '"strings"' "$F"
+          grep -q "ignored map\[string\]struct{}" "$F" || { echo "FATAL: forward patch 失败"; exit 1; }
+          echo "OK: forward 加速补丁已应用"
 
       - name: Inject plugins into plugin.cfg
         working-directory: coredns
         run: |
           NL=$'\\\n'
-          # 注: 官方 CoreDNS 现已自带 https:https(DoH 转发)插件, 不再注入第三方 v-byte-cpu/coredns-https(会与官方撞名 panic)
+          # 官方已自带 https:https(DoH 转发), 不注入第三方 v-byte-cpu/coredns-https(撞名 panic)
           sed -i.bak "s|forward:forward|fallback:github.com/missdeer/fallback${NL}dnsredir:github.com/leiless/dnsredir${NL}forward:forward${NL}proxy:github.com/missdeer/proxy|g" plugin.cfg
           sed -i.bak "s|hosts:hosts|ads:github.com/missdeer/ads${NL}blocklist:github.com/relekang/coredns-blocklist${NL}hosts:hosts|g" plugin.cfg
           sed -i.bak "s|rewrite:rewrite|rewrite:rewrite${NL}bogus:github.com/missdeer/bogus${NL}ipset:github.com/missdeer/ipset|g" plugin.cfg
@@ -84,55 +90,53 @@ jobs:
             done
           fi
           rm -f plugin.cfg.bak
-          echo "----- plugin.cfg -----"
-          cat plugin.cfg
-          # === 硬校验①: dnsredir 三处保障必须齐全, 否则立即失败 ===
-          echo "----- dnsredir 保障校验 -----"
+          echo "----- plugin.cfg -----"; cat plugin.cfg
+          # === 硬校验①: dnsredir 三处保障必须齐全 ===
           grep -q '^dnsredir:github.com/leiless/dnsredir' plugin.cfg || { echo "FATAL: dnsredir 未注入 plugin.cfg"; exit 1; }
           grep -q 'github.com/leiless/dnsredir => ../dnsredir' go.mod || { echo "FATAL: dnsredir 缺少 go.mod replace"; exit 1; }
           test -d ../dnsredir || { echo "FATAL: ../dnsredir 源码目录不存在"; exit 1; }
-          echo "OK: dnsredir 三处保障齐全 (plugin.cfg + go.mod replace + 源码目录)"
+          echo "OK: dnsredir 三处保障齐全"
 
-      - name: Build
+      - name: Build (${{ matrix.name }})
         working-directory: coredns
         env:
-          GOOS: ${{ github.event.inputs.goos }}
-          GOARCH: ${{ github.event.inputs.goarch }}
-          GOARM: ${{ github.event.inputs.goarm }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: '0'
           GO111MODULE: 'on'
         run: |
-          # 忠实复刻 AppVeyor: go generate -> go get -> make (host 平台跑 generate/get)
+          # generate/get 用 host 平台(linux/amd64)跑一次即可
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go generate coredns.go
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go get
+          # make 用目标平台交叉编译
           make
           BIN=coredns; [ "$GOOS" = "windows" ] && BIN=coredns.exe
           file "./$BIN"
-          echo "==== plugins ===="
+          # === 硬校验②: dnsredir 必须真正编入二进制 ===
           if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then
+            # 本机平台: 直接运行验证
             ./coredns -plugins
-            # === 硬校验②: dnsredir 必须真正编入二进制 ===
-            if ./coredns -plugins | grep -qE 'dnsredir$'; then
-              echo "OK: dnsredir 已编入二进制"
-            else
-              echo "FATAL: dnsredir 未出现在 coredns -plugins 输出中!"; exit 1
-            fi
+            ./coredns -plugins | grep -qE 'dnsredir$' && echo "OK: dnsredir 已编入(运行验证)" || { echo "FATAL: dnsredir 缺失"; exit 1; }
+          else
+            # 交叉编译平台: 无法运行, 用符号表验证
+            (go tool nm "./$BIN" 2>/dev/null | grep -q 'leiless/dnsredir' || strings "./$BIN" | grep -q 'leiless/dnsredir') \
+              && echo "OK: dnsredir 已编入(符号验证)" || { echo "FATAL: dnsredir 缺失"; exit 1; }
           fi
 
       - name: Package + checksums
         working-directory: coredns
         run: |
-          BIN=coredns; [ "${{ github.event.inputs.goos }}" = "windows" ] && BIN=coredns.exe
-          sha256sum "$BIN" | tee "$BIN.sha256"
-          md5sum "$BIN" | tee "$BIN.md5"
+          BIN=coredns; [ "${{ matrix.goos }}" = "windows" ] && BIN=coredns.exe
+          OUT="coredns-${{ matrix.name }}"
+          mkdir -p "$OUT"
+          cp "$BIN" "$OUT/"
+          sha256sum "$BIN" | tee "$OUT/$BIN.sha256"
+          md5sum "$BIN"    | tee "$OUT/$BIN.md5"
 
-      - name: Upload artifact
+      - name: Upload artifact (${{ matrix.name }})
         uses: actions/upload-artifact@v5
         with:
-          name: coredns-${{ github.event.inputs.goos }}-${{ github.event.inputs.goarch }}${{ github.event.inputs.goarm }}${{ github.event.inputs.lite && '-lite' || '' }}
-          path: |
-            coredns/coredns
-            coredns/coredns.exe
-            coredns/*.sha256
-            coredns/*.md5
-          if-no-files-found: warn
+          name: coredns-${{ matrix.name }}${{ github.event.inputs.lite && '-lite' || '' }}
+          path: coredns/coredns-${{ matrix.name }}
+          if-no-files-found: error
