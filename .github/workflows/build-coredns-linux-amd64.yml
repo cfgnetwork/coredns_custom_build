@@ -91,7 +91,7 @@ jobs:
       - name: Package + checksums
         working-directory: coredns
         run: |
-          OUT="coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}"
+          OUT="coredns-dnsredir-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}"
           mkdir -p "$OUT"
           cp coredns "$OUT/"
           sha256sum coredns | tee "$OUT/coredns.sha256"
@@ -102,8 +102,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}
-          path: coredns/coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}.zip
+          name: coredns-dnsredir-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}
+          path: coredns/coredns-dnsredir-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}.zip
           if-no-files-found: error
 
       - name: Create / update GitHub Release
@@ -113,7 +113,7 @@ jobs:
           TAG: ${{ github.event.inputs.release_tag }}
         working-directory: coredns
         run: |
-          OUT="coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}"
+          OUT="coredns-dnsredir-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}"
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && \
             gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes || true
           gh release create "$TAG" \
