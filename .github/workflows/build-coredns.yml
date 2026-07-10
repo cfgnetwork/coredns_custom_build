@@ -33,19 +33,38 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.25'
+          cache: false
 
       - name: Clone coredns + dnsredir (同级目录)
         run: |
           git clone --depth=1 https://github.com/coredns/coredns.git
           git clone --depth=1 https://github.com/leiless/dnsredir.git
 
-      - name: Apply patches + inject plugins
+      - name: Patch forward plugin (sed, 替代脆弱的 git apply)
         working-directory: coredns
         run: |
-          CUSTOM="$GITHUB_WORKSPACE/coredns_custom_build"
-          git apply "$CUSTOM/forward.go.patch"
-          git apply "$CUSTOM/forward-setup.go.patch"
+          set -e
+          F=plugin/forward/forward.go
+          S=plugin/forward/setup.go
+          # 1) 加 strings import
+          perl -0pi -e 's/(\t"errors"\n)/$1\t"strings"\n/' "$F"
+          # 2) 字段类型 slice -> map
+          perl -0pi -e 's/\tignored \[\]string/\tignored map[string]struct{}/' "$F"
+          # 3) New() 里初始化 map (原补丁遗漏, 否则运行时 panic)
+          perl -0pi -e 's/(f := &Forward\{maxfails: 2,)/$1 ignored: make(map[string]struct{}),/' "$F"
+          # 4) isAllowedDomain: 逐级后缀查 map (加速 except 列表)
+          perl -0pi -e 's/\tfor _, ignore := range f\.ignored \{\n\t\tif plugin\.Name\(ignore\)\.Matches\(name\) \{\n\t\t\treturn false\n\t\t\}\n\t\}/\tss := strings.Split(name, ".")\n\tfor i := 0; i < len(ss); i++ {\n\t\tn := strings.Join(ss[i:], ".")\n\t\tif _, ok := f.ignored[n]; ok {\n\t\t\treturn false\n\t\t}\n\t}/' "$F"
+          # 5) setup.go: 写入 map 而非 append slice
+          perl -0pi -e 's/\t\t\tf\.ignored = append\(f\.ignored, plugin\.Host\(ignore\[i\]\)\.NormalizeExact\(\)\.\.\.\)/\t\t\tfor _, ignored := range plugin.Host(ignore[i]).NormalizeExact() {\n\t\t\t\tf.ignored[ignored] = struct{}{}\n\t\t\t}/' "$S"
+          echo "----- forward.go 变更校验 -----"
+          grep -n "ignored map\[string\]struct{}" "$F"
+          grep -n "ignored: make(map\[string\]struct{})" "$F"
+          grep -n '"strings"' "$F"
+
+      - name: Inject plugins into plugin.cfg
+        working-directory: coredns
+        run: |
           NL=$'\\\n'
           sed -i.bak "s|forward:forward|fallback:github.com/missdeer/fallback${NL}dnsredir:github.com/leiless/dnsredir${NL}forward:forward${NL}proxy:github.com/missdeer/proxy${NL}https:github.com/v-byte-cpu/coredns-https|g" plugin.cfg
           sed -i.bak "s|hosts:hosts|ads:github.com/missdeer/ads${NL}blocklist:github.com/relekang/coredns-blocklist${NL}hosts:hosts|g" plugin.cfg
@@ -73,13 +92,21 @@ jobs:
           CGO_ENABLED: '0'
           GO111MODULE: 'on'
         run: |
+          # go generate/get 用 host 平台跑, 只有最终 make 用目标平台
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go generate coredns.go
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go get ./... || CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go get
+          go mod tidy
           make
           BIN=coredns; [ "$GOOS" = "windows" ] && BIN=coredns.exe
           file "./$BIN"
           echo "==== plugins ===="
-          [ "$GOOS$GOARCH" = "linuxamd64" ] && ./coredns -plugins || true
+          if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then ./coredns -plugins; fi
+
+      - name: Package + checksums
+        working-directory: coredns
+        run: |
+          BIN=coredns; [ "${{ github.event.inputs.goos }}" = "windows" ] && BIN=coredns.exe
+          sha256sum "$BIN" | tee "$BIN.sha256"
+          md5sum "$BIN" | tee "$BIN.md5"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -88,4 +115,6 @@ jobs:
           path: |
             coredns/coredns
             coredns/coredns.exe
+            coredns/*.sha256
+            coredns/*.md5
           if-no-files-found: warn
