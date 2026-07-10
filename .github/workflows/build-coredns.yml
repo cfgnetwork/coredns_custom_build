@@ -136,7 +136,7 @@ jobs:
           md5sum "$BIN"    | tee "$OUT/$BIN.md5"
 
       - name: Upload artifact (${{ matrix.name }})
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: coredns-${{ matrix.name }}${{ github.event.inputs.lite && '-lite' || '' }}
           path: coredns/coredns-${{ matrix.name }}
