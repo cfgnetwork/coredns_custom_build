@@ -1,0 +1,125 @@
+name: build coredns linux-amd64
+
+# 单平台快速构建: 只出 linux x86_64 (给 lanDNS53 Alpine/Debian)
+# 内容: 官方 CoreDNS 原版全部插件 + 第三方 leiless/dnsredir
+on:
+  workflow_dispatch:
+    inputs:
+      lite:
+        description: 'LITE 精简版? (1=是, 空=否)'
+        required: false
+        default: ''
+      release_tag:
+        description: 'Release 版本号 (留空则不发 Release, 只出 artifact)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
+        env:
+          GOTOOLCHAIN: auto   # 按 coredns/.go-version 自动拉精确 toolchain
+
+      - name: Clone sources into sibling dirs
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/coredns/coredns.git
+          # dnsredir: 默认追随官方最新; 官方不可用时回退到你的 fork 备份
+          if git clone --depth=1 https://github.com/leiless/dnsredir.git dnsredir; then
+            echo "==> dnsredir 源: 官方 leiless/dnsredir (最新)"
+          else
+            echo "==> 官方不可用, 回退到 fork 备份 $OWNER/dnsredir"
+            git clone --depth=1 "https://github.com/$OWNER/dnsredir.git" dnsredir
+          fi
+          ( cd dnsredir && echo "dnsredir HEAD: $(git rev-parse --short HEAD)" && rm -f go.mod go.sum && go mod init github.com/leiless/dnsredir )
+
+      - name: Inject dnsredir into plugin.cfg
+        working-directory: coredns
+        run: |
+          NL=$'\\\n'
+          sed -i.bak "s|forward:forward|dnsredir:github.com/leiless/dnsredir${NL}forward:forward|g" plugin.cfg
+          {
+            printf '\nreplace (\n'
+            printf '    github.com/leiless/dnsredir => ../dnsredir\n'
+            printf ')\n'
+          } >> go.mod
+          for p in azure route53 clouddns k8s_external kubernetes; do
+            sed -i.bak "/$p/d" plugin.cfg
+          done
+          if [ "${{ github.event.inputs.lite }}" = "1" ]; then
+            for p in geoip nsid debug trace autopath erratic metadata cancel pprof dnstap dns64 acl chaos dnssec secondary loop grpc sign; do
+              sed -i.bak "/$p/d" plugin.cfg
+            done
+          fi
+          rm -f plugin.cfg.bak
+          echo "----- plugin.cfg -----"; cat plugin.cfg
+          # === 硬校验①: dnsredir 三处保障必须齐全 ===
+          grep -q '^dnsredir:github.com/leiless/dnsredir' plugin.cfg || { echo "FATAL: dnsredir 未注入 plugin.cfg"; exit 1; }
+          grep -q 'github.com/leiless/dnsredir => ../dnsredir' go.mod || { echo "FATAL: dnsredir 缺少 go.mod replace"; exit 1; }
+          test -d ../dnsredir || { echo "FATAL: ../dnsredir 源码目录不存在"; exit 1; }
+          echo "OK: dnsredir 三处保障齐全"
+
+      - name: Build linux-amd64
+        working-directory: coredns
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+          GO111MODULE: 'on'
+        run: |
+          go generate coredns.go
+          go mod tidy
+          make BINARY=coredns
+          test -f ./coredns || { echo "FATAL: 编译产物不存在"; exit 1; }
+          file ./coredns
+          # === 硬校验②: dnsredir 必须真正编入二进制(本机平台直接运行验证) ===
+          ./coredns -version
+          ./coredns -plugins
+          ./coredns -plugins | grep -qE 'dnsredir$' && echo "OK: dnsredir 已编入" || { echo "FATAL: dnsredir 缺失"; exit 1; }
+
+      - name: Package + checksums
+        working-directory: coredns
+        run: |
+          OUT="coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}"
+          mkdir -p "$OUT"
+          cp coredns "$OUT/"
+          sha256sum coredns | tee "$OUT/coredns.sha256"
+          md5sum coredns    | tee "$OUT/coredns.md5"
+          zip -r "$OUT.zip" "$OUT"
+          ls -l "$OUT.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}
+          path: coredns/coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}.zip
+          if-no-files-found: error
+
+      - name: Create / update GitHub Release
+        if: ${{ github.event.inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag }}
+        working-directory: coredns
+        run: |
+          OUT="coredns-linux-amd64${{ github.event.inputs.lite && '-lite' || '' }}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && \
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CoreDNS linux-amd64 $TAG" \
+            --notes "官方 CoreDNS 原版 + leiless/dnsredir, 仅 linux x86_64。zip 内附 sha256 与 md5 校验和。" \
+            "$OUT.zip"
+          echo "==== Release 已发布: $TAG ===="
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
