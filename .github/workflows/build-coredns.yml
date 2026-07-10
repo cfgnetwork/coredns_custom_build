@@ -69,7 +69,8 @@ jobs:
         working-directory: coredns
         run: |
           NL=$'\\\n'
-          sed -i.bak "s|forward:forward|fallback:github.com/missdeer/fallback${NL}dnsredir:github.com/leiless/dnsredir${NL}forward:forward${NL}proxy:github.com/missdeer/proxy${NL}https:github.com/v-byte-cpu/coredns-https|g" plugin.cfg
+          # 注: 官方 CoreDNS 现已自带 https:https(DoH 转发)插件, 不再注入第三方 v-byte-cpu/coredns-https(会与官方撞名 panic)
+          sed -i.bak "s|forward:forward|fallback:github.com/missdeer/fallback${NL}dnsredir:github.com/leiless/dnsredir${NL}forward:forward${NL}proxy:github.com/missdeer/proxy|g" plugin.cfg
           sed -i.bak "s|hosts:hosts|ads:github.com/missdeer/ads${NL}blocklist:github.com/relekang/coredns-blocklist${NL}hosts:hosts|g" plugin.cfg
           sed -i.bak "s|rewrite:rewrite|rewrite:rewrite${NL}bogus:github.com/missdeer/bogus${NL}ipset:github.com/missdeer/ipset|g" plugin.cfg
           sed -i.bak "s|cache:cache|cache:cache${NL}redisc:github.com/missdeer/redis|g" plugin.cfg
@@ -85,6 +86,12 @@ jobs:
           rm -f plugin.cfg.bak
           echo "----- plugin.cfg -----"
           cat plugin.cfg
+          # === 硬校验①: dnsredir 三处保障必须齐全, 否则立即失败 ===
+          echo "----- dnsredir 保障校验 -----"
+          grep -q '^dnsredir:github.com/leiless/dnsredir' plugin.cfg || { echo "FATAL: dnsredir 未注入 plugin.cfg"; exit 1; }
+          grep -q 'github.com/leiless/dnsredir => ../dnsredir' go.mod || { echo "FATAL: dnsredir 缺少 go.mod replace"; exit 1; }
+          test -d ../dnsredir || { echo "FATAL: ../dnsredir 源码目录不存在"; exit 1; }
+          echo "OK: dnsredir 三处保障齐全 (plugin.cfg + go.mod replace + 源码目录)"
 
       - name: Build
         working-directory: coredns
@@ -102,7 +109,15 @@ jobs:
           BIN=coredns; [ "$GOOS" = "windows" ] && BIN=coredns.exe
           file "./$BIN"
           echo "==== plugins ===="
-          if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then ./coredns -plugins; fi
+          if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then
+            ./coredns -plugins
+            # === 硬校验②: dnsredir 必须真正编入二进制 ===
+            if ./coredns -plugins | grep -qE 'dnsredir$'; then
+              echo "OK: dnsredir 已编入二进制"
+            else
+              echo "FATAL: dnsredir 未出现在 coredns -plugins 输出中!"; exit 1
+            fi
+          fi
 
       - name: Package + checksums
         working-directory: coredns
