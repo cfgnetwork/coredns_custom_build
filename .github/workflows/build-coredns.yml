@@ -8,6 +8,14 @@ on:
         description: 'LITE 精简版? (1=是, 空=否)'
         required: false
         default: ''
+      release_tag:
+        description: 'Release 版本号 (如 v1.14.6-custom; 留空则不发 Release, 只出 artifact)'
+        required: false
+        default: ''
+
+# 授予创建 Release 的写权限
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -129,15 +137,55 @@ jobs:
         working-directory: coredns
         run: |
           BIN=coredns; [ "${{ matrix.goos }}" = "windows" ] && BIN=coredns.exe
-          OUT="coredns-${{ matrix.name }}"
+          OUT="coredns-${{ matrix.name }}${{ github.event.inputs.lite && '-lite' || '' }}"
           mkdir -p "$OUT"
           cp "$BIN" "$OUT/"
           sha256sum "$BIN" | tee "$OUT/$BIN.sha256"
           md5sum "$BIN"    | tee "$OUT/$BIN.md5"
+          # 打成 zip 供 Release 直接分发
+          zip -r "$OUT.zip" "$OUT"
+          ls -l "$OUT.zip"
 
       - name: Upload artifact (${{ matrix.name }})
         uses: actions/upload-artifact@v6
         with:
           name: coredns-${{ matrix.name }}${{ github.event.inputs.lite && '-lite' || '' }}
-          path: coredns/coredns-${{ matrix.name }}
+          path: coredns/coredns-${{ matrix.name }}${{ github.event.inputs.lite && '-lite' || '' }}.zip
           if-no-files-found: error
+
+  # ===== 汇总: 等 5 平台全部编完, 下载所有 zip 并发到 Release =====
+  release:
+    needs: build
+    if: ${{ github.event.inputs.release_tag != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Collect zips
+        run: |
+          mkdir -p release
+          # download-artifact 会按 artifact 名建子目录, 把里面的 zip 全捞出来
+          find dist -name '*.zip' -exec cp {} release/ \;
+          echo "----- release 内容 -----"
+          ls -l release/
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          # 若 tag 已存在则先删旧 Release(保留 tag), 再重建, 保证可重复发布
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && \
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes || true
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CoreDNS custom build $TAG" \
+            --notes "自定义 CoreDNS 构建 (含 dnsredir/fallback/proxy/ads/bogus/ipset/blocklist/redis + 官方 https + forward 加速补丁)。多平台: linux-amd64 / windows-amd64 / linux-arm64 / linux-armv7 / linux-armv6。每个 zip 内附 sha256 与 md5 校验和。" \
+            release/*.zip
+          echo "==== Release 已发布: $TAG ===="
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
